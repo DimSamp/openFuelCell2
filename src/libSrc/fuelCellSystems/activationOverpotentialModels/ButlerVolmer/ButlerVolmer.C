@@ -141,6 +141,66 @@ void Foam::activationOverpotentialModels::ButlerVolmer<Thermo>::correct()
     //- The total current: volume averaged
     scalar Rj(0.0);
 
+    //- Coupled phiE-phiI solve (see electric::solveCoupled): the ion
+    //- region then holds dJdEta and etaE. Instead of evaluating j from
+    //- the lagged potentials, the base point is rebuilt from the realised
+    //- current Jr = SI of the last coupled solve (inverse update):
+    //- eta* = G^-1(Jr), dJdEta = G'(eta*), etaE = eta* + E, j = sign(n) Jr
+    const bool coupled =
+        ionPhase.template foundObject<volScalarField>("dJdEta");
+
+    if (coupled)
+    {
+        if (mag(this->alpha_ - 0.5) > SMALL)
+        {
+            FatalErrorInFunction
+                << "The coupled phiE-phiI solve supports alpha = 0.5 only"
+                << exit(FatalError);
+        }
+
+        scalarField& dJdEta = const_cast<volScalarField&>
+        (
+            ionPhase.template lookupObject<volScalarField>("dJdEta")
+        );
+        scalarField& etaE = const_cast<volScalarField&>
+        (
+            ionPhase.template lookupObject<volScalarField>("etaE")
+        );
+
+        forAll(cells, cellI)
+        {
+            const label fluidId = cells[cellI];
+            const label ionId =
+                ionPhase.cellMap()[fluidPhase.cellMapIO()[fluidId]];
+
+            //- alpha = 1/2: G(eta) = 2 kin sinh(fh eta), fh = |n| F/(2 R T)
+            const scalar kin = Foam::max
+            (
+                this->j0_.value()*coeff[fluidId]
+               *Foam::pow(s[fluidId], this->gamma_),
+                SMALL*this->j0_.value()
+            );
+            const scalar fh = 0.5*mag(n)*F/Rgas/T[fluidId];
+            const scalar Jr = SI[ionId];
+
+            eta[fluidId] = Foam::asinh(Jr/(2*kin))/fh;
+            dJdEta[ionId] = fh*Foam::sqrt(sqr(2*kin) + sqr(Jr));
+            etaE[ionId] = eta[fluidId] + nernst[fluidId];
+
+            //- Species/heat see no reverse current (as the segregated max)
+            j[fluidId] = Foam::max(sign*Jr, scalar(0));
+
+            Rj += fluidPhase.V()[fluidId] * j[fluidId];
+        }
+
+        reduce(Rj, sumOp<scalar>());
+
+        Info << "Total current (A) at " << this->zoneName_
+             << ": " << Rj << " (coupled)" << endl;
+
+        return;
+    }
+
     forAll(cells, cellI)
     {
         //- get cell IDs

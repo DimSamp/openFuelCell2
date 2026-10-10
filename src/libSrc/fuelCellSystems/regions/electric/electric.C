@@ -34,6 +34,8 @@ License
 #include "activationOverpotentialModel.H"
 
 #include "fuelCellSystem.H"
+#include "lduPrimitiveMesh.H"
+#include "lduMatrix.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
@@ -139,7 +141,11 @@ Foam::regionTypes::electric::electric
     cellZoneIDs_(),
     galvanostatic_(true),
     ibar_(nullptr),
-    voltage_(nullptr)
+    voltage_(nullptr),
+    coupled_(false),
+    solvedByCoupler_(false),
+    electronRegion_(word::null),
+    omega_(1.0)
 {
     if (dissolveOnOff_)
     {
@@ -176,6 +182,67 @@ Foam::regionTypes::electric::electric
             cellZoneIDs_ = this->cellZones().indices(zoneName_);
         }
     }
+
+    //- Coupled phiE-phiI solve, set in the ion region:
+    //  coupled { active yes; electronRegion phiE; omega 1; }
+    if (dict_.found("coupled"))
+    {
+        const dictionary& coupledDict = dict_.subDict("coupled");
+        coupled_ = coupledDict.get<Switch>("active");
+
+        if (coupled_)
+        {
+            electronRegion_ = coupledDict.get<word>("electronRegion");
+            omega_ = coupledDict.getOrDefault<scalar>("omega", 1.0);
+
+            //- Their existence switches ButlerVolmer to coupled mode
+            dJdEta_.reset
+            (
+                new volScalarField
+                (
+                    IOobject
+                    (
+                        "dJdEta",
+                        this->time().timeName(),
+                        *this,
+                        IOobject::NO_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    *this,
+                    dimensionedScalar(j_.dimensions()/phi_.dimensions(), Zero)
+                )
+            );
+            etaE_.reset
+            (
+                new volScalarField
+                (
+                    IOobject
+                    (
+                        "etaE",
+                        this->time().timeName(),
+                        *this,
+                        IOobject::NO_READ,
+                        IOobject::NO_WRITE
+                    ),
+                    *this,
+                    dimensionedScalar(phi_.dimensions(), Zero)
+                )
+            );
+
+            //- The electron region (constructed before) is solved from here
+            electric& electron = const_cast<electric&>
+            (
+                refCast<const electric>
+                (
+                    this->time().lookupObject<regionType>(electronRegion_)
+                )
+            );
+            electron.solvedByCoupler_ = true;
+
+            Info<< "Region " << name() << ": coupled solve with "
+                << electronRegion_ << ", omega = " << omega_ << endl;
+        }
+    }
 }
 
 
@@ -188,6 +255,17 @@ Foam::regionTypes::electric::~electric()
 
 void Foam::regionTypes::electric::solve()
 {
+    if (solvedByCoupler_)
+    {
+        return;
+    }
+
+    if (coupled_)
+    {
+        solveCoupled();
+        return;
+    }
+
     Info << "\nSolve for region " << name() << ":\n" << endl;
 
     tmp<fvScalarMatrix> phiEqn
@@ -224,6 +302,257 @@ void Foam::regionTypes::electric::solve()
     if (dissolved_.valid())
     {
         dissolved_->solve();
+    }
+}
+
+
+void Foam::regionTypes::electric::solveCoupled()
+{
+    //- Called in the ion region. Unknowns [phiE; phiI] in one matrix.
+    //- J of both regions holds the base-point current J* (= realised
+    //- current of the previous iteration), ButlerVolmer has written
+    //- dJdEta = G'(eta*) and etaE = eta* + E in the CL cells.
+    electric& eR = const_cast<electric&>
+    (
+        refCast<const electric>
+        (
+            this->time().lookupObject<regionType>(electronRegion_)
+        )
+    );
+    electric& iR = *this;
+
+    Info<< "\nCoupled solve for regions " << eR.name() << " + " << iR.name()
+        << ":\n" << endl;
+
+    if (Pstream::parRun())
+    {
+        FatalErrorInFunction
+            << "The coupled phiE-phiI solve is serial only"
+            << exit(FatalError);
+    }
+
+    //- Segregated matrices: -laplacian(sigma, phi) - J
+    fvScalarMatrix eEqn
+    (
+      - fvm::laplacian(eR.sigmaField_, eR.phi_, "laplacian(sigma,phi)")
+      - eR.j_
+    );
+    fvScalarMatrix iEqn
+    (
+      - fvm::laplacian(iR.sigmaField_, iR.phi_, "laplacian(sigma,phi)")
+      - iR.j_
+    );
+
+    const label nE = eR.nCells();
+    const label nI = iR.nCells();
+    const label nCells = nE + nI;
+
+    //- Cell pairs: ion cell -> electron cell (via the parent mesh)
+    DynamicList<label> pairE;
+    DynamicList<label> pairI;
+    forAll(iR.cellMapIO_, cellI)
+    {
+        const auto iter = eR.cellMap_.cfind(iR.cellMapIO_[cellI]);
+        if (iter.good())
+        {
+            pairI.append(cellI);
+            pairE.append(iter.val());
+        }
+    }
+    const label nP = pairI.size();
+
+    //- Addressing: phiE faces, phiI faces (offset nE), one link per pair
+    const labelUList& lE = eR.lduAddr().lowerAddr();
+    const labelUList& uE = eR.lduAddr().upperAddr();
+    const labelUList& lI = iR.lduAddr().lowerAddr();
+    const labelUList& uI = iR.lduAddr().upperAddr();
+    const label nFE = lE.size();
+    const label nFI = lI.size();
+    const label nF = nFE + nFI + nP;
+
+    labelList lower(nF);
+    labelList upper(nF);
+    scalarField upperCoeffs(nF);
+
+    const scalarField& upperE = eEqn.upper();
+    const scalarField& upperI = iEqn.upper();
+
+    for (label f = 0; f < nFE; ++f)
+    {
+        lower[f] = lE[f];
+        upper[f] = uE[f];
+        upperCoeffs[f] = upperE[f];
+    }
+    for (label f = 0; f < nFI; ++f)
+    {
+        lower[nFE + f] = nE + lI[f];
+        upper[nFE + f] = nE + uI[f];
+        upperCoeffs[nFE + f] = upperI[f];
+    }
+
+    //- Diagonal and source, boundary contributions folded in
+    //- (as fvMatrix::solve does with addBoundaryDiag/addBoundarySource)
+    scalarField diag(nCells);
+    scalarField source(nCells);
+    scalarField psi(nCells);
+
+    SubList<scalar>(diag, nE, 0) = eEqn.diag();
+    SubList<scalar>(diag, nI, nE) = iEqn.diag();
+    SubList<scalar>(source, nE, 0) = eEqn.source();
+    SubList<scalar>(source, nI, nE) = iEqn.source();
+    SubList<scalar>(psi, nE, 0) = eR.phi_.primitiveField();
+    SubList<scalar>(psi, nI, nE) = iR.phi_.primitiveField();
+
+    auto addBoundary = [&](const electric& r, const fvScalarMatrix& eqn, label off)
+    {
+        forAll(r.phi_.boundaryField(), patchi)
+        {
+            if (r.phi_.boundaryField()[patchi].coupled())
+            {
+                FatalErrorInFunction
+                    << "Coupled patch " << r.boundary()[patchi].name()
+                    << " in region " << r.name() << " is not supported"
+                    << exit(FatalError);
+            }
+
+            const labelUList& fc = r.boundary()[patchi].faceCells();
+            const scalarField& ic = eqn.internalCoeffs()[patchi];
+            const scalarField& bc = eqn.boundaryCoeffs()[patchi];
+
+            forAll(fc, k)
+            {
+                diag[off + fc[k]] += ic[k];
+                source[off + fc[k]] += bc[k];
+            }
+        }
+    };
+    addBoundary(eR, eEqn, 0);
+    addBoundary(iR, iEqn, nE);
+
+    //- Coupling terms, r = omega*V*G'(eta*):
+    //  row e: (aP + r) phiE - r phiI = -V J* + r (eta* + E)
+    //  row i: (aP + r) phiI - r phiE = +V J* - r (eta* + E)
+    //  (the V J* parts are already in the source through "- J")
+    const scalarField& V = iR.V();
+    const scalarField& dJdEta = dJdEta_();
+    const scalarField& etaE = etaE_();
+    scalarField r(nP);
+
+    forAll(pairI, p)
+    {
+        const label e = pairE[p];
+        const label i = pairI[p];
+        r[p] = omega_*V[i]*dJdEta[i];
+
+        lower[nFE + nFI + p] = e;
+        upper[nFE + nFI + p] = nE + i;
+        upperCoeffs[nFE + nFI + p] = -r[p];
+
+        diag[e] += r[p];
+        diag[nE + i] += r[p];
+        source[e] += r[p]*etaE[i];
+        source[nE + i] -= r[p]*etaE[i];
+    }
+
+    //- Upper-triangular face order
+    const labelList oldToNew
+    (
+        lduPrimitiveMesh::upperTriOrder(nCells, lower, upper)
+    );
+
+    labelList lowerNew(nF);
+    labelList upperNew(nF);
+    scalarField upperCoeffsNew(nF);
+    forAll(oldToNew, f)
+    {
+        lowerNew[oldToNew[f]] = lower[f];
+        upperNew[oldToNew[f]] = upper[f];
+        upperCoeffsNew[oldToNew[f]] = upperCoeffs[f];
+    }
+
+    lduPrimitiveMesh lduMesh
+    (
+        nCells,
+        lowerNew,
+        upperNew,
+        UPstream::worldComm,
+        true
+    );
+
+    //- Symmetric matrix: only diag and upper are set
+    lduMatrix M(lduMesh);
+    M.diag() = diag;
+    M.upper() = upperCoeffsNew;
+
+    const FieldField<Field, scalar> interfaceBouCoeffs(0);
+    const FieldField<Field, scalar> interfaceIntCoeffs(0);
+    const lduInterfaceFieldPtrsList interfaces(0);
+
+    solverPerformance perf = lduMatrix::solver::New
+    (
+        "phiCoupled",
+        M,
+        interfaceBouCoeffs,
+        interfaceIntCoeffs,
+        interfaces,
+        iR.solverDict("phiCoupled")
+    )->solve(psi, source);
+
+    Info<< perf.solverName() << ":  Solving for phiCoupled"
+        << ", Initial residual = " << perf.initialResidual()
+        << ", Final residual = " << perf.finalResidual()
+        << ", No Iterations " << perf.nIterations() << endl;
+
+    //- Scatter back
+    eR.phi_.primitiveFieldRef() = SubList<scalar>(psi, nE, 0);
+    iR.phi_.primitiveFieldRef() = SubList<scalar>(psi, nI, nE);
+    eR.phi_.correctBoundaryConditions();
+    iR.phi_.correctBoundaryConditions();
+
+    //- Realised current J = J* + (r/V)(etaNew - eta*), it becomes the
+    //- base-point current of the next iteration
+    scalar maxDelta = 0;
+    scalar Ipos = 0;
+    scalar Ineg = 0;
+
+    forAll(pairI, p)
+    {
+        const label e = pairE[p];
+        const label i = pairI[p];
+
+        const scalar delta = eR.phi_[e] - iR.phi_[i] - etaE[i];
+        const scalar Jreal = iR.j_[i] + r[p]/V[i]*delta;
+
+        iR.j_[i] = Jreal;
+        eR.j_[e] = -Jreal;
+
+        maxDelta = max(maxDelta, mag(delta));
+        Ipos += max(Jreal, scalar(0))*V[i];
+        Ineg += min(Jreal, scalar(0))*V[i];
+    }
+    eR.j_.correctBoundaryConditions();
+    iR.j_.correctBoundaryConditions();
+
+    Info<< "Coupled: pairs = " << nP
+        << ", max|eta_new - eta*| = " << maxDelta
+        << " V, I+ (A) = " << Ipos
+        << ", I- (A) = " << Ineg
+        << ", rel. imbalance = " << (Ipos + Ineg)/max(Ipos, VSMALL)
+        << endl;
+
+    //- Current densities and dissolved model, as in the segregated solve
+    eR.i_ = -eR.sigmaField_*fvc::grad(eR.phi_);
+    eR.i_.correctBoundaryConditions();
+    iR.i_ = -iR.sigmaField_*fvc::grad(iR.phi_);
+    iR.i_.correctBoundaryConditions();
+
+    if (eR.dissolved_.valid())
+    {
+        eR.dissolved_->solve();
+    }
+    if (iR.dissolved_.valid())
+    {
+        iR.dissolved_->solve();
     }
 }
 

@@ -127,6 +127,26 @@ private:
         //- Make semse when galvanostatic_ is false
         autoPtr<Function1<scalar>> voltage_;
 
+        //- Coupled phiE-phiI solve (set in the ion region, sub-dict 'coupled')
+        Switch coupled_;
+
+        //- True in the electron region when the ion region solves it
+        bool solvedByCoupler_;
+
+        //- Electron region name (coupled mode)
+        word electronRegion_;
+
+        //- Newton damping of the coupling coefficient, (0, 1]
+        scalar omega_;
+
+        //- Written by ButlerVolmer in coupled mode (ion region, CL cells):
+        //- dJ/deta at the base point [A/V/m3] and eta* + E [V]
+        autoPtr<volScalarField> dJdEta_;
+        autoPtr<volScalarField> etaE_;
+
+        //- One monolithic phiE-phiI solve with Newton-linearised kinetics
+        void solveCoupled();
+
 public:
         TypeName("electric");
 
