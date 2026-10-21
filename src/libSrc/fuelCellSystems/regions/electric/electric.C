@@ -36,6 +36,8 @@ License
 #include "fuelCellSystem.H"
 #include "lduPrimitiveMesh.H"
 #include "lduMatrix.H"
+#include "lduPrimitiveProcessorInterface.H"
+#include "processorFvPatch.H"
 
 // * * * * * * * * * * * * * * Static Data Members * * * * * * * * * * * * * //
 
@@ -324,13 +326,6 @@ void Foam::regionTypes::electric::solveCoupled()
     Info<< "\nCoupled solve for regions " << eR.name() << " + " << iR.name()
         << ":\n" << endl;
 
-    if (Pstream::parRun())
-    {
-        FatalErrorInFunction
-            << "The coupled phiE-phiI solve is serial only"
-            << exit(FatalError);
-    }
-
     //- Segregated matrices: -laplacian(sigma, phi) - J
     fvScalarMatrix eEqn
     (
@@ -347,7 +342,9 @@ void Foam::regionTypes::electric::solveCoupled()
     const label nI = iR.nCells();
     const label nCells = nE + nI;
 
-    //- Cell pairs: ion cell -> electron cell (via the parent mesh)
+    //- Cell pairs: ion cell -> electron cell (via the parent mesh).
+    //- In parallel all copies of a cell are on the same processor
+    //- (decomposeParID), so the pairs are always local.
     DynamicList<label> pairE;
     DynamicList<label> pairI;
     forAll(iR.cellMapIO_, cellI)
@@ -391,7 +388,11 @@ void Foam::regionTypes::electric::solveCoupled()
     }
 
     //- Diagonal and source, boundary contributions folded in
-    //- (as fvMatrix::solve does with addBoundaryDiag/addBoundarySource)
+    //- (as fvMatrix::solve does with addBoundaryDiag/addBoundarySource).
+    //- Processor patches become interfaces of the combined matrix: their
+    //- faceCells are offset like the cells, the communication is done by
+    //- the processor patch fields of phi, which take the faceCells from
+    //- the combined addressing (lduAddr.patchAddr).
     scalarField diag(nCells);
     scalarField source(nCells);
     scalarField psi(nCells);
@@ -403,18 +404,18 @@ void Foam::regionTypes::electric::solveCoupled()
     SubList<scalar>(psi, nE, 0) = eR.phi_.primitiveField();
     SubList<scalar>(psi, nI, nE) = iR.phi_.primitiveField();
 
+    PtrList<const lduInterface> procInterfaces;
+    lduInterfaceFieldPtrsList interfaces;
+    FieldField<Field, scalar> interfaceBouCoeffs;
+    FieldField<Field, scalar> interfaceIntCoeffs;
+
     auto addBoundary = [&](const electric& r, const fvScalarMatrix& eqn, label off)
     {
+        const lduInterfaceFieldPtrsList phiInterfaces =
+            r.phi_.boundaryField().scalarInterfaces();
+
         forAll(r.phi_.boundaryField(), patchi)
         {
-            if (r.phi_.boundaryField()[patchi].coupled())
-            {
-                FatalErrorInFunction
-                    << "Coupled patch " << r.boundary()[patchi].name()
-                    << " in region " << r.name() << " is not supported"
-                    << exit(FatalError);
-            }
-
             const labelUList& fc = r.boundary()[patchi].faceCells();
             const scalarField& ic = eqn.internalCoeffs()[patchi];
             const scalarField& bc = eqn.boundaryCoeffs()[patchi];
@@ -422,8 +423,58 @@ void Foam::regionTypes::electric::solveCoupled()
             forAll(fc, k)
             {
                 diag[off + fc[k]] += ic[k];
-                source[off + fc[k]] += bc[k];
             }
+
+            if (!r.phi_.boundaryField()[patchi].coupled())
+            {
+                forAll(fc, k)
+                {
+                    source[off + fc[k]] += bc[k];
+                }
+                continue;
+            }
+
+            if (!isA<processorFvPatch>(r.boundary()[patchi]))
+            {
+                FatalErrorInFunction
+                    << "Coupled patch " << r.boundary()[patchi].name()
+                    << " in region " << r.name() << " is not supported"
+                    << exit(FatalError);
+            }
+
+            const processorFvPatch& pp =
+                refCast<const processorFvPatch>(r.boundary()[patchi]);
+
+            labelList fcOff(fc.size());
+            forAll(fc, k)
+            {
+                fcOff[k] = off + fc[k];
+            }
+
+            const label k = procInterfaces.size();
+
+            procInterfaces.resize(k + 1);
+            procInterfaces.set
+            (
+                k,
+                new lduPrimitiveProcessorInterface
+                (
+                    fcOff,
+                    pp.myProcNo(),
+                    pp.neighbProcNo(),
+                    pp.forwardT(),
+                    pp.tag(),
+                    pp.comm()
+                )
+            );
+
+            interfaces.resize(k + 1);
+            interfaces.set(k, phiInterfaces.get(patchi));
+
+            interfaceBouCoeffs.resize(k + 1);
+            interfaceBouCoeffs.set(k, new scalarField(bc));
+            interfaceIntCoeffs.resize(k + 1);
+            interfaceIntCoeffs.set(k, new scalarField(ic));
         }
     };
     addBoundary(eR, eEqn, 0);
@@ -470,23 +521,34 @@ void Foam::regionTypes::electric::solveCoupled()
         upperCoeffsNew[oldToNew[f]] = upperCoeffs[f];
     }
 
+    lduInterfacePtrsList meshInterfaces(procInterfaces.size());
+    forAll(procInterfaces, k)
+    {
+        meshInterfaces.set(k, &procInterfaces[k]);
+    }
+    const lduSchedule schedule
+    (
+        lduPrimitiveMesh::nonBlockingSchedule<processorLduInterface>
+        (
+            meshInterfaces
+        )
+    );
+
+    //- The mesh takes ownership of procInterfaces
     lduPrimitiveMesh lduMesh
     (
         nCells,
         lowerNew,
         upperNew,
-        UPstream::worldComm,
-        true
+        procInterfaces,
+        schedule,
+        UPstream::worldComm
     );
 
     //- Symmetric matrix: only diag and upper are set
     lduMatrix M(lduMesh);
     M.diag() = diag;
     M.upper() = upperCoeffsNew;
-
-    const FieldField<Field, scalar> interfaceBouCoeffs(0);
-    const FieldField<Field, scalar> interfaceIntCoeffs(0);
-    const lduInterfaceFieldPtrsList interfaces(0);
 
     solverPerformance perf = lduMatrix::solver::New
     (
@@ -533,7 +595,13 @@ void Foam::regionTypes::electric::solveCoupled()
     eR.j_.correctBoundaryConditions();
     iR.j_.correctBoundaryConditions();
 
-    Info<< "Coupled: pairs = " << nP
+    label nPairs = nP;
+    reduce(nPairs, sumOp<label>());
+    reduce(maxDelta, maxOp<scalar>());
+    reduce(Ipos, sumOp<scalar>());
+    reduce(Ineg, sumOp<scalar>());
+
+    Info<< "Coupled: pairs = " << nPairs
         << ", max|eta_new - eta*| = " << maxDelta
         << " V, I+ (A) = " << Ipos
         << ", I- (A) = " << Ineg
