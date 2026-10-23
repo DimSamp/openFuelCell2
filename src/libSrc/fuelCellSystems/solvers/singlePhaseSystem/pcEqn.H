@@ -65,6 +65,10 @@ constrainPressure(p_rgh_, rho, U, phiHbyA, rhorAtU, MRF_);
         }
     }
 
+    // Explicitly relax pressure for momentum corrector, before p is updated
+    // so that p (thermo, correctRho, next iteration) is the relaxed pressure
+    p_rgh_.relax();
+
     // Update and limit the static pressure
     p = max(p_rgh_ + rho*gh, pMin);
 
@@ -73,9 +77,6 @@ constrainPressure(p_rgh_, rho, U, phiHbyA, rhorAtU, MRF_);
 
 //#include "rhoEqn.H"
 //#include "compressibleContinuityErrs.H"
-
-// Explicitly relax pressure for momentum corrector
-p_rgh_.relax();
 
 U = HbyA - rAtU*fvc::grad(p_rgh_);
 U.correctBoundaryConditions();
